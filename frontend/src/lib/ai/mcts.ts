@@ -63,16 +63,52 @@ function select(node: Node): Node {
   return best as Node;
 }
 
-/** Run MCTS and return visit counts keyed by "bi,ci", plus the move lookup. */
+export interface MctsBudget {
+  /** Fixed simulation count (used when timeBudgetMs is 0/absent). */
+  simulations?: number;
+  /** Wall-clock budget in ms; runs until this elapses (or maxSims is hit). */
+  timeBudgetMs?: number;
+  /** Hard cap on simulations regardless of time. */
+  maxSims?: number;
+}
+
+/**
+ * Run MCTS and return visit counts keyed by "bi,ci", plus the move lookup.
+ * Stops on whichever of {time budget, sim cap, fixed sim count} comes first.
+ */
 export async function runMcts(
   rootState: State,
   session: InferenceSession,
-  simulations = 128,
+  budget: MctsBudget = {},
 ): Promise<{ counts: Map<string, number>; moves: Map<string, Move> }> {
   const root = new Node(1, rootState);
   await expand(root, session);
 
-  for (let s = 0; s < simulations; s++) {
+  const collect = () => {
+    const counts = new Map<string, number>();
+    for (const [k, child] of root.children) counts.set(k, child.N);
+    return { counts, moves: root.moves };
+  };
+
+  // Terminal or forced move: no search needed.
+  if (root.children.size <= 1) return collect();
+
+  const timeBudgetMs = budget.timeBudgetMs ?? 0;
+  const fixedSims = budget.simulations ?? 128;
+  const maxSims = budget.maxSims && budget.maxSims > 0 ? budget.maxSims : Infinity;
+  const start = performance.now();
+  // Re-check the clock only every few sims to avoid performance.now() overhead.
+  const TIME_CHECK_EVERY = 16;
+
+  let s = 0;
+  while (true) {
+    if (timeBudgetMs > 0) {
+      if (s >= maxSims) break;
+      if (s % TIME_CHECK_EVERY === 0 && performance.now() - start >= timeBudgetMs) break;
+    } else if (s >= fixedSims) {
+      break;
+    }
+
     let node = root;
     const path: Node[] = [node];
 
@@ -93,9 +129,8 @@ export async function runMcts(
       n.Q = n.W / n.N;
       v = -v;
     }
+    s++;
   }
 
-  const counts = new Map<string, number>();
-  for (const [k, child] of root.children) counts.set(k, child.N);
-  return { counts, moves: root.moves };
+  return collect();
 }

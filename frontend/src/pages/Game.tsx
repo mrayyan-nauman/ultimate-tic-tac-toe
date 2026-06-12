@@ -1,20 +1,45 @@
-import { useState, useCallback, useEffect } from "react";
+import { useState, useCallback, useEffect, useMemo } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import confetti from "canvas-confetti";
 import PlayerIcon from "@/components/PlayerIcon";
 import UltimateTicTacToe from "@/components/UltimateTicTacToe";
-import { checkWinner, getRandomAIMove, createEmptyBoards, createEmptyWinners } from "@/lib/gameLogic";
-import { getAIMove, warmUpAI } from "@/lib/ai";
+import { checkWinner, createEmptyBoards, createEmptyWinners } from "@/lib/gameLogic";
+import { requestMove, warmUpAI } from "@/lib/ai/aiClient";
+import { difficultyToConfig, ratingTier } from "@/lib/ai/difficulty";
 import { Button } from "@/components/ui/button";
-import { RotateCcw } from "lucide-react";
-import { useNavigate } from "react-router-dom";
+import { RotateCcw, SlidersHorizontal } from "lucide-react";
+import { useNavigate, useSearchParams, Navigate } from "react-router-dom";
 
+type Mark = "X" | "O";
+
+const markColor = (m: Mark) => (m === "X" ? "text-player-blue" : "text-player-red");
+const markGlow = (m: Mark) => (m === "X" ? "text-glow-blue" : "text-glow-red");
+
+/** Parses + validates the difficulty/side params, redirecting to setup if absent. */
 const Game = () => {
+  const [params] = useSearchParams();
+  const levelRaw = Number(params.get("level"));
+  const sideRaw = params.get("side");
+
+  const validLevel = Number.isFinite(levelRaw) && levelRaw >= 1 && levelRaw <= 2000;
+  const validSide = sideRaw === "X" || sideRaw === "O";
+  if (!validLevel || !validSide) return <Navigate to="/play" replace />;
+
+  const level = Math.round(levelRaw);
+  // Remount fresh state whenever the chosen game parameters change.
+  return <GameBoard key={`${level}-${sideRaw}`} level={level} humanPlayer={sideRaw as Mark} />;
+};
+
+const GameBoard = ({ level, humanPlayer }: { level: number; humanPlayer: Mark }) => {
   const navigate = useNavigate();
+  const aiPlayer: Mark = humanPlayer === "X" ? "O" : "X";
+  const config = useMemo(() => difficultyToConfig(level), [level]);
+  const tier = ratingTier(level);
+
   const [boards, setBoards] = useState(createEmptyBoards);
   const [boardWinners, setBoardWinners] = useState(createEmptyWinners);
   const [activeBoard, setActiveBoard] = useState<number | null>(null);
-  const [currentPlayer, setCurrentPlayer] = useState<"X" | "O">("X");
+  const [currentPlayer, setCurrentPlayer] = useState<Mark>("X"); // X always moves first
   const [gameWinner, setGameWinner] = useState<string | null>(null);
   const [isAIThinking, setIsAIThinking] = useState(false);
 
@@ -22,7 +47,6 @@ const Game = () => {
     const duration = 3000;
     const end = Date.now() + duration;
     const colors = gameWinner === "X" ? ["#3b82f6", "#60a5fa"] : ["#ef4444", "#f87171"];
-
     (function frame() {
       confetti({ particleCount: 3, angle: 60, spread: 55, origin: { x: 0 }, colors });
       confetti({ particleCount: 3, angle: 120, spread: 55, origin: { x: 1 }, colors });
@@ -34,16 +58,12 @@ const Game = () => {
     if (gameWinner && gameWinner !== "D") fireConfetti();
   }, [gameWinner, fireConfetti]);
 
-  const handleCellClick = useCallback(
-    (boardIndex: number, cellIndex: number) => {
-      if (gameWinner || currentPlayer !== "X" || isAIThinking) return;
-      makeMove(boardIndex, cellIndex, "X");
-    },
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-    [gameWinner, currentPlayer, isAIThinking, boards, boardWinners, activeBoard]
-  );
+  // Warm up the net (download + WASM init in the worker) on mount.
+  useEffect(() => {
+    warmUpAI();
+  }, []);
 
-  const makeMove = (boardIndex: number, cellIndex: number, player: string) => {
+  const makeMove = (boardIndex: number, cellIndex: number, player: Mark) => {
     const newBoards = boards.map((b) => [...b]);
     newBoards[boardIndex][cellIndex] = player;
 
@@ -62,37 +82,37 @@ const Game = () => {
 
     if (overallWinner) {
       setGameWinner(overallWinner);
-      return { newBoards, newBoardWinners, nextActive, overallWinner };
+      return;
     }
-
     setCurrentPlayer(player === "X" ? "O" : "X");
-    return { newBoards, newBoardWinners, nextActive, overallWinner: null };
   };
 
-  // Warm up the neural net (download + WASM init) when the board mounts so the
-  // first AI move isn't delayed.
-  useEffect(() => {
-    warmUpAI();
-  }, []);
+  const handleCellClick = useCallback(
+    (boardIndex: number, cellIndex: number) => {
+      if (gameWinner || currentPlayer !== humanPlayer || isAIThinking) return;
+      makeMove(boardIndex, cellIndex, humanPlayer);
+    },
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [gameWinner, currentPlayer, isAIThinking, boards, boardWinners, activeBoard, humanPlayer]
+  );
 
-  // AI turn — runs the AlphaZero MCTS entirely in the browser.
+  // AI turn — runs the AlphaZero AI in a Web Worker at the chosen difficulty.
   useEffect(() => {
-    if (currentPlayer !== "O" || gameWinner) return;
+    if (currentPlayer !== aiPlayer || gameWinner) return;
 
     setIsAIThinking(true);
     let cancelled = false;
 
     (async () => {
-      let move: { boardIndex: number; cellIndex: number } | null = null;
-      try {
-        move = await getAIMove(boards, boardWinners, activeBoard, "O");
-      } catch (err) {
-        console.warn("Browser AI failed, using random fallback:", err);
-        move = getRandomAIMove(boards, boardWinners, activeBoard);
-      }
-
+      const move = await requestMove({
+        boards,
+        boardWinners,
+        activeBoard,
+        player: aiPlayer,
+        config,
+      });
       if (cancelled) return;
-      if (move) makeMove(move.boardIndex, move.cellIndex, "O");
+      if (move) makeMove(move.boardIndex, move.cellIndex, aiPlayer);
       setIsAIThinking(false);
     })();
 
@@ -111,48 +131,53 @@ const Game = () => {
     setIsAIThinking(false);
   };
 
-  const winnerLabel = gameWinner === "X" ? "You" : gameWinner === "O" ? "AI" : null;
+  const winnerLabel =
+    gameWinner === humanPlayer ? "You" : gameWinner === aiPlayer ? "AI" : null;
 
   return (
     <div className="min-h-screen flex flex-col items-center justify-center p-4 relative">
-      {/* Top left: Player icon */}
+      {/* Top center: difficulty badge */}
+      <div className="absolute top-4 left-1/2 -translate-x-1/2 text-center">
+        <div className="text-xs tracking-widest uppercase text-muted-foreground font-[var(--font-display)]">
+          AI Rating
+        </div>
+        <div className="text-lg font-black tabular-nums text-foreground">
+          {level} <span className="text-muted-foreground font-normal text-xs">· {tier}</span>
+        </div>
+      </div>
+
+      {/* Top left: human */}
       <div className="absolute top-4 left-4">
         <PlayerIcon
-          player="X"
-          isActive={currentPlayer === "X" && !gameWinner}
-          isWinner={gameWinner === "X"}
+          player={humanPlayer}
+          isActive={currentPlayer === humanPlayer && !gameWinner}
+          isWinner={gameWinner === humanPlayer}
         />
-        <span className="text-xs text-player-blue font-[var(--font-display)] mt-1 block text-center">
+        <span className={`text-xs ${markColor(humanPlayer)} font-[var(--font-display)] mt-1 block text-center`}>
           YOU
         </span>
       </div>
 
-      {/* Bottom right: AI icon */}
+      {/* Bottom right: AI */}
       <div className="absolute bottom-4 right-4">
         <PlayerIcon
-          player="O"
-          isActive={currentPlayer === "O" && !gameWinner}
-          isWinner={gameWinner === "O"}
+          player={aiPlayer}
+          isActive={currentPlayer === aiPlayer && !gameWinner}
+          isWinner={gameWinner === aiPlayer}
         />
-        <span className="text-xs text-player-red font-[var(--font-display)] mt-1 block text-center">
+        <span className={`text-xs ${markColor(aiPlayer)} font-[var(--font-display)] mt-1 block text-center`}>
           AI
         </span>
       </div>
 
       {/* Turn indicator */}
-      <div className="mb-4">
+      <div className="mb-4 mt-10">
         <p
           className={`text-sm font-[var(--font-display)] tracking-widest ${
-            currentPlayer === "X" ? "text-player-blue text-glow-blue" : "text-player-red text-glow-red"
+            currentPlayer === humanPlayer ? `${markColor(humanPlayer)} ${markGlow(humanPlayer)}` : `${markColor(aiPlayer)} ${markGlow(aiPlayer)}`
           }`}
         >
-          {gameWinner
-            ? ""
-            : isAIThinking
-            ? "AI IS THINKING..."
-            : currentPlayer === "X"
-            ? "YOUR TURN"
-            : ""}
+          {gameWinner ? "" : isAIThinking ? "AI IS THINKING..." : currentPlayer === humanPlayer ? "YOUR TURN" : ""}
         </p>
       </div>
 
@@ -162,14 +187,18 @@ const Game = () => {
         boardWinners={boardWinners}
         activeBoard={activeBoard}
         onCellClick={handleCellClick}
-        disabled={!!gameWinner || isAIThinking || currentPlayer !== "X"}
+        disabled={!!gameWinner || isAIThinking || currentPlayer !== humanPlayer}
       />
 
       {/* Controls */}
       <div className="mt-6 flex gap-3">
         <Button variant="outline" size="sm" onClick={resetGame} className="gap-2 font-[var(--font-display)] text-xs">
           <RotateCcw size={14} />
-          RESTART
+          PLAY AGAIN
+        </Button>
+        <Button variant="outline" size="sm" onClick={() => navigate("/play")} className="gap-2 font-[var(--font-display)] text-xs">
+          <SlidersHorizontal size={14} />
+          DIFFICULTY
         </Button>
         <Button variant="ghost" size="sm" onClick={() => navigate("/")} className="font-[var(--font-display)] text-xs text-muted-foreground">
           EXIT
@@ -195,9 +224,7 @@ const Game = () => {
                 animate={{ opacity: [1, 0.3, 1] }}
                 transition={{ duration: 1, repeat: Infinity }}
                 className={`text-5xl md:text-7xl font-black tracking-tight ${
-                  gameWinner === "X"
-                    ? "text-player-blue text-glow-blue"
-                    : "text-player-red text-glow-red"
+                  gameWinner === "X" ? "text-player-blue text-glow-blue" : "text-player-red text-glow-red"
                 }`}
               >
                 {winnerLabel} WON!
@@ -206,8 +233,8 @@ const Game = () => {
                 <Button onClick={resetGame} className="font-[var(--font-display)] glow-blue">
                   PLAY AGAIN
                 </Button>
-                <Button variant="outline" onClick={() => navigate("/")} className="font-[var(--font-display)]">
-                  EXIT
+                <Button variant="outline" onClick={() => navigate("/play")} className="font-[var(--font-display)]">
+                  CHANGE DIFFICULTY
                 </Button>
               </div>
             </motion.div>
@@ -225,6 +252,9 @@ const Game = () => {
               <div className="mt-8 flex gap-4 justify-center">
                 <Button onClick={resetGame} className="font-[var(--font-display)]">
                   PLAY AGAIN
+                </Button>
+                <Button variant="outline" onClick={() => navigate("/play")} className="font-[var(--font-display)]">
+                  CHANGE DIFFICULTY
                 </Button>
               </div>
             </motion.div>

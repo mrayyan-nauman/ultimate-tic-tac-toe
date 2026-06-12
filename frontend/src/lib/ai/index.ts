@@ -1,23 +1,50 @@
 // Public entrypoint for the in-browser AlphaZero AI.
-// Mirrors backend/ai.py: load the net, run MCTS, play the most-visited move.
-// Falls back to a random legal move if the model can't load or inference fails,
-// so the game is always playable.
+// Applies a difficulty config (epsilon / temperature / search budget) on top of
+// the AlphaZero net + MCTS. Falls back to a random legal move if the model can't
+// load or inference fails, so the game is always playable.
 
 import { State, Move, legalMoves } from "./engine";
 import { loadModel } from "./net";
+import { predict } from "./net";
 import { runMcts } from "./mcts";
+import { AIConfig, difficultyToConfig } from "./difficulty";
 
-// Matches INFERENCE_SIMULATIONS in backend/ai.py. Higher = stronger but slower.
-const SIMULATIONS = 128;
+export type { AIConfig } from "./difficulty";
+export interface MoveResult {
+  boardIndex: number;
+  cellIndex: number;
+}
 
-function randomMove(moves: Move[]): { boardIndex: number; cellIndex: number } | null {
-  if (moves.length === 0) return null;
+function uniformRandom(moves: Move[]): MoveResult {
   const [bi, ci] = moves[Math.floor(Math.random() * moves.length)];
   return { boardIndex: bi, cellIndex: ci };
 }
 
-/** Kick off model loading early (e.g. on the game screen mount) so the first
- *  move isn't delayed by the ~1 MB download + WASM init. Fire-and-forget. */
+/** Pick from parallel (move, weight) arrays using a temperature.
+ *  temperature ~0 → argmax; 1 → proportional; large → more uniform. */
+function sampleByTemperature(moves: Move[], weights: number[], temperature: number): MoveResult {
+  if (temperature <= 1e-3) {
+    let best = 0;
+    for (let i = 1; i < weights.length; i++) if (weights[i] > weights[best]) best = i;
+    const [bi, ci] = moves[best];
+    return { boardIndex: bi, cellIndex: ci };
+  }
+  const adj = weights.map((w) => Math.pow(Math.max(w, 0), 1 / temperature));
+  const sum = adj.reduce((a, b) => a + b, 0);
+  if (!(sum > 0)) return uniformRandom(moves);
+  let r = Math.random() * sum;
+  for (let i = 0; i < moves.length; i++) {
+    r -= adj[i];
+    if (r <= 0) {
+      const [bi, ci] = moves[i];
+      return { boardIndex: bi, cellIndex: ci };
+    }
+  }
+  const [bi, ci] = moves[moves.length - 1];
+  return { boardIndex: bi, cellIndex: ci };
+}
+
+/** Kick off model loading early so the first move isn't delayed. Fire-and-forget. */
 export function warmUpAI(): void {
   loadModel().catch(() => {
     /* fallback handled in getAIMove */
@@ -25,15 +52,16 @@ export function warmUpAI(): void {
 }
 
 /**
- * Choose the AI's move for the current position.
- * Accepts the frontend's loose board types and narrows internally.
+ * Choose the AI's move for the current position at the given difficulty.
+ * `config` may be an AIConfig or a raw rating (1..2000); defaults to max.
  */
 export async function getAIMove(
   boards: (string | null)[][],
   boardWinners: (string | null)[],
   activeBoard: number | null,
   player: "X" | "O" = "O",
-): Promise<{ boardIndex: number; cellIndex: number } | null> {
+  config?: AIConfig | number,
+): Promise<MoveResult | null> {
   const state: State = {
     boards: boards as State["boards"],
     winners: boardWinners as State["winners"],
@@ -44,29 +72,45 @@ export async function getAIMove(
   const moves = legalMoves(state);
   if (moves.length === 0) return null;
 
+  const cfg: AIConfig =
+    typeof config === "number"
+      ? difficultyToConfig(config)
+      : config ?? difficultyToConfig(2000);
+
+  // 1) Blunder roll: with probability epsilon, play a uniformly random move.
+  if (cfg.epsilon > 0 && Math.random() < cfg.epsilon) return uniformRandom(moves);
+
+  // Only one legal move? Take it without spinning up the net.
+  if (moves.length === 1) return uniformRandom(moves);
+
   let session;
   try {
     session = await loadModel();
   } catch (err) {
     console.warn("[AI] model load failed, playing randomly:", err);
-    return randomMove(moves);
+    return uniformRandom(moves);
   }
 
   try {
-    const { counts, moves: moveLookup } = await runMcts(state, session, SIMULATIONS);
-    let bestKey: string | null = null;
-    let bestN = -1;
-    for (const [k, n] of counts) {
-      if (n > bestN) {
-        bestN = n;
-        bestKey = k;
-      }
+    // 2) Low end: no tree search — sample the raw policy at temperature.
+    if (cfg.timeBudgetMs <= 0) {
+      const { moves: pMoves, probs } = await predict(session, state);
+      if (pMoves.length === 0) return uniformRandom(moves);
+      return sampleByTemperature(pMoves, probs, cfg.temperature);
     }
-    if (bestKey === null) return randomMove(moves);
-    const [bi, ci] = moveLookup.get(bestKey) as Move;
-    return { boardIndex: bi, cellIndex: ci };
+
+    // 3) Search: time-budgeted MCTS, then pick by visit counts at temperature.
+    const { counts, moves: lookup } = await runMcts(state, session, {
+      timeBudgetMs: cfg.timeBudgetMs,
+      maxSims: cfg.maxSims,
+    });
+    const keys = [...counts.keys()];
+    if (keys.length === 0) return uniformRandom(moves);
+    const visits = keys.map((k) => counts.get(k) as number);
+    const mvs = keys.map((k) => lookup.get(k) as Move);
+    return sampleByTemperature(mvs, visits, cfg.temperature);
   } catch (err) {
     console.warn("[AI] inference failed, playing randomly:", err);
-    return randomMove(moves);
+    return uniformRandom(moves);
   }
 }

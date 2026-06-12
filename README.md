@@ -38,11 +38,44 @@ TypeScript engine/encoder reproduces the canonical Python implementation
 
 ```
 ┌─────────────────── Browser (static site) ───────────────────┐
-│  React UI ──▶ TypeScript MCTS ──▶ ONNX Runtime Web (WASM)    │
-│                                      └─ az_net.onnx (1.2 MB) │
+│  React UI ──▶ Web Worker ──▶ TS MCTS ──▶ ONNX Runtime (WASM) │
+│                                            └─ az_net.onnx     │
 └──────────────────────────────────────────────────────────────┘
    No backend at runtime. Flask + PyTorch are for training only.
+   The AI runs in a Web Worker so even a long "think" never freezes the UI.
 ```
+
+## Difficulty rating (1–2000) and sides
+
+Before each game you pick an **AI rating from 1 to 2000** (a "compressed chess
+rating" — higher is harder) and **which side you play** (X always moves first, so
+choosing O lets the AI open). The rating maps (`frontend/src/lib/ai/difficulty.ts`)
+to three strength knobs that together span the whole range:
+
+| Range        | Behaviour                                                         |
+| ------------ | ----------------------------------------------------------------- |
+| 1            | Uniformly random moves                                            |
+| ~1–600       | Mostly random → raw policy, no tree search                        |
+| ~600–1400    | Light, then growing MCTS; temperature softens move choice         |
+| ~1400–1999   | Argmax MCTS, thinking budget up to **10 s**                       |
+| 2000         | The strongest the deployed net can play — up to **60 s** / move   |
+
+**2000 is anchored to the *currently deployed* network.** Train and deploy a
+stronger net and "2000" automatically re-anchors to that net's maximum, with the
+rest of the scale shifting accordingly — no UI change needed.
+
+### Raising the ceiling (making 2000 stronger)
+
+The strength of the top end is set by the network, and the AlphaZero self-play
+loop can keep improving it with more training. To push the ceiling:
+
+```bash
+cd backend
+python train_az.py 200      # more self-play iterations = stronger net
+python export_onnx.py       # re-export to frontend/public/az_net.onnx
+```
+
+Redeploy and the whole 1–2000 scale re-anchors to the new maximum.
 
 ## Tech stack
 
@@ -110,8 +143,9 @@ ultimate-tic-tac-toe/
 ├── frontend/                 # React + Vite game (the deployed app)
 │   ├── public/az_net.onnx    # trained net, exported for the browser
 │   └── src/
-│       ├── lib/ai/           # engine, encode, net (ONNX), mcts, entrypoint
-│       ├── pages/            # Landing, Game
+│       ├── lib/ai/           # engine, encode, net (ONNX), mcts, difficulty,
+│       │                     #   aiWorker + aiClient (Web Worker), entrypoint
+│       ├── pages/            # Landing, Setup (difficulty + sides), Game
 │       └── components/       # board UI + shadcn/ui
 ├── backend/                  # PyTorch training + Flask API (dev/training only)
 │   ├── engine.py net.py mcts.py    # canonical game + AlphaZero net + MCTS

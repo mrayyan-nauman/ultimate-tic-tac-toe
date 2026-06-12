@@ -54,7 +54,7 @@ const Landing = () => {
         >
           <Button
             size="lg"
-            onClick={() => navigate("/game")}
+            onClick={() => navigate("/play")}
             className="text-lg px-10 py-6 bg-primary hover:bg-primary/90 text-primary-foreground glow-blue font-[var(--font-display)] tracking-wider"
           >
             START GAME
