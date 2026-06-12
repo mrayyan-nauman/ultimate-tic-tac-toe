@@ -4,7 +4,7 @@ A polished, neon-styled [Ultimate Tic-Tac-Toe](https://en.wikipedia.org/wiki/Ult
 where you play against an **AlphaZero-style AI that runs entirely in your browser** —
 no backend, no server costs, no cold starts.
 
-🔗 **Live demo:** _https://ultimate-tic-tac-toe.vercel.app_ <!-- updated after first deploy -->
+🔗 **Live demo:** **https://ultimate-tic-tac-toe-alpha.vercel.app**
 
 ---
 
