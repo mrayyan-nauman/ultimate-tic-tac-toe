@@ -1,0 +1,29 @@
+# ───────────── Python / backend ─────────────
+venv/
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# Trained Q-table is 1.2 GB — regenerate with `python backend/train.py`
+backend/qtable.pkl
+
+# ───────────── Node / frontend ─────────────
+node_modules/
+frontend/dist/
+frontend/dist-ssr/
+*.local
+
+# ───────────── Editors / OS / tooling ─────────────
+.vscode/*
+!.vscode/extensions.json
+.idea/
+.DS_Store
+Thumbs.db
+.claude/
+
+# ───────────── Personal / unrelated files living in this folder ─────────────
+PrecisionTouchPad_DCH_ASUS_Z_V16.0.0.41_47015.exe
+*.lit
+*.exe

@@ -1,0 +1,10 @@
+# Core runtime (Flask API + neural net inference)
+flask>=3.1
+flask-cors>=6.0
+numpy>=2.0
+torch>=2.2
+
+# Only needed to (re-)export the model to ONNX for the web frontend:
+#   python export_onnx.py
+onnx>=1.16
+onnxruntime>=1.18

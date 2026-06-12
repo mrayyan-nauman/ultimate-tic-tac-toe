@@ -1,0 +1,97 @@
+@import url('https://fonts.googleapis.com/css2?family=Orbitron:wght@400;500;600;700;800;900&family=Inter:wght@300;400;500;600&display=swap');
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    --background: 225 25% 8%;
+    --foreground: 220 20% 90%;
+
+    --card: 225 20% 12%;
+    --card-foreground: 220 20% 90%;
+
+    --popover: 225 20% 12%;
+    --popover-foreground: 220 20% 90%;
+
+    --primary: 217 91% 60%;
+    --primary-foreground: 0 0% 100%;
+
+    --secondary: 225 20% 16%;
+    --secondary-foreground: 220 20% 90%;
+
+    --muted: 225 15% 18%;
+    --muted-foreground: 220 10% 50%;
+
+    --accent: 225 20% 20%;
+    --accent-foreground: 220 20% 90%;
+
+    --destructive: 0 72% 55%;
+    --destructive-foreground: 0 0% 100%;
+
+    --border: 225 15% 20%;
+    --input: 225 15% 20%;
+    --ring: 217 91% 60%;
+
+    --radius: 0.5rem;
+
+    --player-blue: 217 91% 60%;
+    --player-blue-glow: 217 100% 70%;
+    --player-red: 0 72% 55%;
+    --player-red-glow: 0 100% 65%;
+
+    --board-bg: 225 20% 14%;
+    --cell-bg: 225 18% 18%;
+    --cell-hover: 225 18% 24%;
+    --cell-active: 217 40% 25%;
+
+    --font-display: 'Orbitron', sans-serif;
+    --font-body: 'Inter', sans-serif;
+  }
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+
+  body {
+    @apply bg-background text-foreground;
+    font-family: var(--font-body);
+  }
+
+  h1, h2, h3, h4, h5, h6 {
+    font-family: var(--font-display);
+  }
+}
+
+@layer utilities {
+  .glow-blue {
+    box-shadow: 0 0 20px hsl(var(--player-blue) / 0.5), 0 0 60px hsl(var(--player-blue) / 0.2);
+  }
+  .glow-red {
+    box-shadow: 0 0 20px hsl(var(--player-red) / 0.5), 0 0 60px hsl(var(--player-red) / 0.2);
+  }
+  .text-glow-blue {
+    text-shadow: 0 0 20px hsl(var(--player-blue) / 0.8);
+  }
+  .text-glow-red {
+    text-shadow: 0 0 20px hsl(var(--player-red) / 0.8);
+  }
+}
+
+@keyframes pulse-glow-blue {
+  0%, 100% { box-shadow: 0 0 20px hsl(var(--player-blue) / 0.4); }
+  50% { box-shadow: 0 0 40px hsl(var(--player-blue) / 0.8), 0 0 80px hsl(var(--player-blue) / 0.3); }
+}
+
+@keyframes pulse-glow-red {
+  0%, 100% { box-shadow: 0 0 20px hsl(var(--player-red) / 0.4); }
+  50% { box-shadow: 0 0 40px hsl(var(--player-red) / 0.8), 0 0 80px hsl(var(--player-red) / 0.3); }
+}
+
+@keyframes blink {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.3; }
+}

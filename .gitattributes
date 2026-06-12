@@ -1,0 +1,11 @@
+# Normalize line endings for text files; check out LF everywhere.
+* text=auto eol=lf
+
+# Binary assets — never diff or convert.
+*.onnx binary
+*.pt   binary
+*.pkl  binary
+*.wasm binary
+*.ico  binary
+*.png  binary
+*.jpg  binary
