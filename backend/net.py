@@ -98,6 +98,28 @@ class AZNet(nn.Module):
         return self.policy_head(h), self.value_head(h).squeeze(-1)
 
 
+class OldAZNet(nn.Module):
+    """The original pre-GPU 3-layer MLP. Kept so training can load the previous
+    deployed model (az_net.pt.bak) as a fixed benchmark opponent for Elo gating.
+    Same I/O contract (486 in -> 81 policy + 1 value)."""
+    def __init__(self, hidden=256):
+        super().__init__()
+        self.trunk = nn.Sequential(
+            nn.Linear(INPUT_DIM, hidden), nn.ReLU(),
+            nn.Linear(hidden, hidden), nn.ReLU(),
+            nn.Linear(hidden, hidden), nn.ReLU(),
+        )
+        self.policy_head = nn.Linear(hidden, NUM_ACTIONS)
+        self.value_head = nn.Sequential(
+            nn.Linear(hidden, 64), nn.ReLU(),
+            nn.Linear(64, 1), nn.Tanh(),
+        )
+
+    def forward(self, x):
+        h = self.trunk(x)
+        return self.policy_head(h), self.value_head(h).squeeze(-1)
+
+
 @torch.no_grad()
 def predict(net, state, device="cpu"):
     """Return (policy_probs over legal moves dict, value scalar)."""

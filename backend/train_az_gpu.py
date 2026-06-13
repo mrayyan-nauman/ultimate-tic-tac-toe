@@ -1,21 +1,24 @@
-"""Batched, GPU-accelerated AlphaZero self-play training with resume + Elo gating.
+"""Batched, GPU-accelerated AlphaZero self-play training.
 
 Plays many games in parallel and evaluates all of their MCTS leaves in a single
-batched forward pass per simulation step, so the GPU does large batches instead
-of thousands of tiny batch-1 calls. The scalar game core (apply_move / winner /
-legal_moves / encode) is Numba-compiled in fastcore.py (validated bit-identical
-to the canonical engine), which removes the Python game-op bottleneck.
+batched forward pass per simulation step. The scalar game core is Numba-compiled
+in fastcore.py (validated bit-identical to engine.py), removing the Python
+game-op bottleneck.
 
-Campaign features:
-  * Resume from az_net.pt (if architecture matches); best net always kept there.
-  * Elo gating: a candidate only replaces `best` if it wins a head-to-head match
-    (>= win threshold). Running Elo in az_net.meta.json.
-  * --deploy: on finish, if a promotion happened this run, export to ONNX + git
-    push (auto-deploys via Vercel).
+Two-level gating:
+  * Lineage gate (internal): a candidate replaces the running `best` only if it
+    wins a head-to-head match vs `best` (>= WIN_THRESHOLD). `best` therefore
+    never regresses against its own lineage. Saved to the *training* checkpoint
+    (az_net.train.pt, gitignored).
+  * Deploy gate (external): the published model (az_net.pt, committed) is only
+    updated when `best` beats the OLD pre-GPU net (az_net.pt.bak) by
+    VS_OLD_THRESH. Every eval logs the best-vs-old score, so progress toward the
+    real opponent is measurable. With --deploy, a passing net is exported +
+    pushed (Vercel redeploys).
 
-Tunables via env vars:
+Tunables via env:
     UTTT_GAMES UTTT_SIMS UTTT_EVAL_GAMES UTTT_EVAL_SIMS UTTT_EVAL_EVERY
-    UTTT_WIN_THRESH UTTT_MINUTES UTTT_CKPT
+    UTTT_WIN_THRESH UTTT_VS_OLD_THRESH UTTT_FINAL_EVAL_GAMES UTTT_MINUTES UTTT_CKPT
 
 Usage:
     python train_az_gpu.py [iterations] [--deploy]
@@ -34,10 +37,14 @@ import torch
 import torch.nn.functional as F
 
 import fastcore as fc
-from net import AZNet
+from net import AZNet, OldAZNet
 
-CKPT_PATH = os.environ.get("UTTT_CKPT", os.path.join(os.path.dirname(__file__), "az_net.pt"))
-META_PATH = CKPT_PATH[:-3] + ".meta.json" if CKPT_PATH.endswith(".pt") else CKPT_PATH + ".meta.json"
+HERE = os.path.dirname(os.path.abspath(__file__))
+DEPLOY_CKPT = os.environ.get("UTTT_CKPT", os.path.join(HERE, "az_net.pt"))
+DEPLOY_META = DEPLOY_CKPT[:-3] + ".meta.json" if DEPLOY_CKPT.endswith(".pt") else DEPLOY_CKPT + ".meta.json"
+TRAIN_CKPT = DEPLOY_CKPT[:-3] + ".train.pt" if DEPLOY_CKPT.endswith(".pt") else DEPLOY_CKPT + ".train.pt"
+TRAIN_META = DEPLOY_CKPT[:-3] + ".train.json" if DEPLOY_CKPT.endswith(".pt") else DEPLOY_CKPT + ".train.json"
+OLD_PATH = DEPLOY_CKPT + ".bak"
 
 PARALLEL_GAMES = int(os.environ.get("UTTT_GAMES", 256))
 MCTS_SIMULATIONS = int(os.environ.get("UTTT_SIMS", 64))
@@ -45,6 +52,8 @@ EVAL_GAMES = int(os.environ.get("UTTT_EVAL_GAMES", 40))
 EVAL_SIMS = int(os.environ.get("UTTT_EVAL_SIMS", 64))
 EVAL_EVERY = int(os.environ.get("UTTT_EVAL_EVERY", 2))
 WIN_THRESHOLD = float(os.environ.get("UTTT_WIN_THRESH", 0.55))
+VS_OLD_THRESH = float(os.environ.get("UTTT_VS_OLD_THRESH", 0.55))
+FINAL_EVAL_GAMES = int(os.environ.get("UTTT_FINAL_EVAL_GAMES", 80))
 MINUTES = float(os.environ.get("UTTT_MINUTES", 0))
 
 NUM_ACTIONS = 81
@@ -59,7 +68,6 @@ LR = 1e-3
 MAX_PLIES = 81
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-LABEL = {1: "X", 2: "O", 3: "D"}
 
 
 class Node:
@@ -227,7 +235,7 @@ def self_play(net, n_games):
 
 def duel(net_a, net_b, n_games, sims):
     """net_a vs net_b, colors alternated. Returns net_a's score fraction."""
-    games = [(Game(), i % 2 == 0) for i in range(n_games)]   # a_is_x flag
+    games = [(Game(), i % 2 == 0) for i in range(n_games)]
     active = list(games)
     move_no = 0
     while active and move_no < MAX_PLIES:
@@ -295,41 +303,59 @@ def elo_diff(score):
 
 
 def load_meta():
-    if os.path.exists(META_PATH):
-        try:
-            with open(META_PATH) as f:
-                return json.load(f)
-        except Exception:
-            pass
-    return {"elo": 0.0, "promotions": 0, "iterations": 0}
+    for p in (TRAIN_META, DEPLOY_META):
+        if os.path.exists(p):
+            try:
+                with open(p) as f:
+                    return json.load(f)
+            except Exception:
+                pass
+    return {"elo": 0.0, "promotions": 0, "vs_old": None}
 
 
-def save_meta(meta):
-    with open(META_PATH, "w") as f:
-        json.dump(meta, f, indent=2)
+def save_json(path, obj):
+    with open(path, "w") as f:
+        json.dump(obj, f, indent=2)
 
 
-def try_load(net, path):
-    if os.path.exists(path):
-        try:
-            net.load_state_dict(torch.load(path, map_location=DEVICE))
-            return True
-        except Exception as e:
-            print(f"[resume] checkpoint incompatible, starting fresh: {e}", flush=True)
-    return False
-
-
-def deploy_best(meta, promotions_this_run):
-    here = os.path.dirname(os.path.abspath(__file__))
-    repo = os.path.dirname(here)
+def load_into(net, path):
     try:
-        print("[deploy] exporting ONNX + pushing...", flush=True)
-        subprocess.run([sys.executable, os.path.join(here, "export_onnx.py")], check=True, cwd=here)
+        net.load_state_dict(torch.load(path, map_location=DEVICE))
+        return True
+    except Exception as e:
+        print(f"[resume] {os.path.basename(path)} incompatible: {e}", flush=True)
+        return False
+
+
+def resume(net):
+    for p in (TRAIN_CKPT, DEPLOY_CKPT):
+        if os.path.exists(p) and load_into(net, p):
+            return os.path.basename(p)
+    return None
+
+
+def load_old():
+    if not os.path.exists(OLD_PATH):
+        print(f"[old] benchmark {os.path.basename(OLD_PATH)} not found — deploy gating disabled", flush=True)
+        return None
+    old = OldAZNet().to(DEVICE)
+    if not load_into(old, OLD_PATH):
+        return None
+    old.eval()
+    return old
+
+
+def deploy_best(best, meta, vs_old):
+    try:
+        print("[deploy] best beats old — exporting ONNX + pushing...", flush=True)
+        torch.save(best.state_dict(), DEPLOY_CKPT)
+        save_json(DEPLOY_META, {"elo": meta["elo"], "promotions": meta["promotions"], "vs_old": vs_old})
+        subprocess.run([sys.executable, os.path.join(HERE, "export_onnx.py")], check=True, cwd=HERE)
+        repo = os.path.dirname(HERE)
         subprocess.run(["git", "-C", repo, "add", "backend/az_net.pt",
                         "backend/az_net.meta.json", "frontend/public/az_net.onnx"], check=True)
         subprocess.run(["git", "-C", repo, "commit", "-m",
-                        f"Train: deploy gated net (elo {meta['elo']:.0f}, +{promotions_this_run} this run)"],
-                       check=True)
+                        f"Train: deploy net that beats old (vs_old={vs_old:.2f}, elo {meta['elo']:.0f})"], check=True)
         subprocess.run(["git", "-C", repo, "push", "origin", "main"], check=True)
         print("[deploy] pushed — Vercel will redeploy.", flush=True)
     except Exception as e:
@@ -348,27 +374,28 @@ def main():
     if DEVICE == "cuda":
         torch.backends.cudnn.benchmark = True
 
-    fc.validate_against_engine(60)  # safety + warms up the Numba JIT
+    fc.validate_against_engine(60)  # safety + warm up the JIT
 
     net = AZNet().to(DEVICE)
-    resumed = try_load(net, CKPT_PATH)
+    src = resume(net)
     net.eval()
     best = AZNet().to(DEVICE)
     best.load_state_dict(net.state_dict())
     best.eval()
+    old = load_old()
     opt = torch.optim.Adam(net.parameters(), lr=LR)
     buffer = deque(maxlen=REPLAY_CAPACITY)
     meta = load_meta()
 
     nparams = sum(p.numel() for p in net.parameters())
     budget = f"{MINUTES:.0f}min" if MINUTES > 0 else f"{iterations} iters"
-    print(f"[init] device={DEVICE} params={nparams:,} resumed={resumed} start_elo={meta['elo']:.0f} "
+    print(f"[init] device={DEVICE} params={nparams:,} resume={src} start_elo={meta['elo']:.0f} "
           f"games/iter={PARALLEL_GAMES} sims={MCTS_SIMULATIONS} eval={EVAL_GAMES}g/{EVAL_SIMS}s "
-          f"every {EVAL_EVERY} thresh={WIN_THRESHOLD} budget={budget} deploy={deploy}", flush=True)
+          f"every {EVAL_EVERY} winthr={WIN_THRESHOLD} vs_old_thr={VS_OLD_THRESH} "
+          f"old={'yes' if old is not None else 'no'} budget={budget} deploy={deploy}", flush=True)
 
     t_start = time.time()
     it = 0
-    promotions_this_run = 0
     while True:
         if MINUTES > 0:
             if (time.time() - t_start) >= MINUTES * 60:
@@ -386,16 +413,19 @@ def main():
         if it % EVAL_EVERY == 0:
             score = duel(net, best, EVAL_GAMES, EVAL_SIMS)
             if score > WIN_THRESHOLD:
-                d = elo_diff(score)
-                meta["elo"] += d
+                meta["elo"] += elo_diff(score)
                 meta["promotions"] += 1
-                promotions_this_run += 1
                 best.load_state_dict(net.state_dict())
-                torch.save(best.state_dict(), CKPT_PATH)
-                save_meta(meta)
-                gate = f"PROMOTED score={score:.2f} +{d:.0f} -> elo={meta['elo']:.0f}"
+                torch.save(best.state_dict(), TRAIN_CKPT)
+                save_json(TRAIN_META, meta)
+                gate = f"PROMOTED {score:.2f} -> elo={meta['elo']:.0f}"
             else:
-                gate = f"rejected score={score:.2f} (keep best elo={meta['elo']:.0f})"
+                gate = f"rejected {score:.2f}"
+            if old is not None:
+                vs_old = duel(best, old, EVAL_GAMES, EVAL_SIMS)
+                meta["vs_old"] = vs_old
+                save_json(TRAIN_META, meta)
+                gate += f" | vs_old={vs_old:.2f}"
 
         msg = (f"[iter {it}] X/O/D={results[1]}/{results[2]}/{results[3]} "
                f"buffer={len(buffer)} selfplay={time.time() - t0:.1f}s")
@@ -406,13 +436,20 @@ def main():
         msg += f" | total={time.time() - t_start:.0f}s"
         print(msg, flush=True)
 
-    print(f"[done] iters={it} best_elo={meta['elo']:.0f} promotions={meta['promotions']} "
-          f"(+{promotions_this_run} this run) time={time.time() - t_start:.0f}s", flush=True)
+    # Final, larger best-vs-old measurement → deploy decision.
+    final_vs_old = None
+    if old is not None:
+        final_vs_old = duel(best, old, FINAL_EVAL_GAMES, EVAL_SIMS)
+        print(f"[vs-old] final: best scores {final_vs_old:.0%} vs old over {FINAL_EVAL_GAMES} games "
+              f"(need >= {VS_OLD_THRESH:.0%} to deploy)", flush=True)
+    print(f"[done] iters={it} elo={meta['elo']:.0f} promotions={meta['promotions']} "
+          f"time={time.time() - t_start:.0f}s", flush=True)
 
-    if deploy and promotions_this_run > 0:
-        deploy_best(meta, promotions_this_run)
+    if deploy and final_vs_old is not None and final_vs_old >= VS_OLD_THRESH:
+        deploy_best(best, meta, final_vs_old)
     elif deploy:
-        print("[deploy] no promotions this run; nothing to deploy.", flush=True)
+        why = "no old benchmark" if final_vs_old is None else f"vs_old={final_vs_old:.2f} < {VS_OLD_THRESH}"
+        print(f"[deploy] not deploying ({why}); live site unchanged.", flush=True)
 
 
 if __name__ == "__main__":

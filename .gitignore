@@ -30,3 +30,7 @@ PrecisionTouchPad_DCH_ASUS_Z_V16.0.0.41_47015.exe
 
 # local model backups
 *.bak
+
+# training-only checkpoints (the deployed az_net.pt is the gated/published one)
+*.train.pt
+*.train.json
