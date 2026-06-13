@@ -4,7 +4,7 @@
 
 import * as ort from "onnxruntime-web";
 import { State, Move, legalMoves } from "./engine";
-import { encodeState, moveToIndex, INPUT_DIM } from "./encode";
+import { encodeStateV2, moveToIndex, INPUT_DIM_V2 } from "./encode";
 
 // Serve the WASM runtime from the CDN build that matches the installed package
 // version. Single-threaded so we don't need SharedArrayBuffer / COOP-COEP headers.
@@ -38,7 +38,7 @@ export async function predict(
   session: ort.InferenceSession,
   state: State,
 ): Promise<Prediction> {
-  const input = new ort.Tensor("float32", encodeState(state), [1, INPUT_DIM]);
+  const input = new ort.Tensor("float32", encodeStateV2(state), [1, INPUT_DIM_V2]);
   const out = await session.run({ input });
 
   const logits = out.policy.data as Float32Array; // 81 raw logits

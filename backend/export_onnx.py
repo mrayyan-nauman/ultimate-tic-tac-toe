@@ -12,9 +12,15 @@ import os
 
 import torch
 
-from net import AZNet, INPUT_DIM
+from net import AZNet, INPUT_DIM, INPUT_DIM_V2
 
-CKPT_PATH = os.path.join(os.path.dirname(__file__), "az_net.pt")
+# UTTT_PLANES=11 exports the v2 (tactical-plane) net; UTTT_EXPORT_SRC overrides
+# which checkpoint to export (default az_net.pt).
+PLANES = int(os.environ.get("UTTT_PLANES", 6))
+INPUT = INPUT_DIM_V2 if PLANES == 11 else INPUT_DIM
+CKPT_PATH = os.environ.get(
+    "UTTT_EXPORT_SRC", os.path.join(os.path.dirname(__file__), "az_net.pt")
+)
 OUT_PATH = os.path.join(
     os.path.dirname(__file__), "..", "frontend", "public", "az_net.onnx"
 )
@@ -24,11 +30,11 @@ def main():
     if not os.path.exists(CKPT_PATH):
         raise SystemExit(f"Checkpoint not found: {CKPT_PATH}")
 
-    net = AZNet()
+    net = AZNet(input_dim=INPUT)
     net.load_state_dict(torch.load(CKPT_PATH, map_location="cpu"))
     net.eval()
 
-    dummy = torch.zeros(1, INPUT_DIM, dtype=torch.float32)
+    dummy = torch.zeros(1, INPUT, dtype=torch.float32)
     out_path = os.path.abspath(OUT_PATH)
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
 
@@ -52,7 +58,7 @@ def main():
     import onnxruntime as ort
 
     sess = ort.InferenceSession(out_path, providers=["CPUExecutionProvider"])
-    probe = torch.randn(1, INPUT_DIM, dtype=torch.float32)
+    probe = torch.randn(1, INPUT, dtype=torch.float32)
     with torch.no_grad():
         ref_policy, ref_value = net(probe)
     ort_policy, ort_value = sess.run(None, {"input": probe.numpy()})
