@@ -8,3 +8,8 @@ torch>=2.2
 #   python export_onnx.py
 onnx>=1.16
 onnxruntime>=1.18
+
+# GPU self-play training only (train_az_gpu.py): Numba JITs the game core.
+# For CUDA, install a matching torch build, e.g.:
+#   pip install torch --index-url https://download.pytorch.org/whl/cu128
+numba>=0.60

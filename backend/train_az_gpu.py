@@ -2,13 +2,9 @@
 
 Plays many games in parallel and evaluates all of their MCTS leaves in a single
 batched forward pass per simulation step, so the GPU does large batches instead
-of thousands of tiny batch-1 calls. Tree management is plain Python on one core,
-so the laptop stays responsive while the GPU is fed.
-
-(Note: a numpy int-array "fast core" was tried and *regressed* — numpy's per-call
-overhead on tiny 9x9 arrays is higher than Python tuples for the scalar game ops,
-which run far more often than the batched encode. The tuple engine below is the
-faster one. A genuine speedup would need Numba/C for the scalar hot loop.)
+of thousands of tiny batch-1 calls. The scalar game core (apply_move / winner /
+legal_moves / encode) is Numba-compiled in fastcore.py (validated bit-identical
+to the canonical engine), which removes the Python game-op bottleneck.
 
 Campaign features:
   * Resume from az_net.pt (if architecture matches); best net always kept there.
@@ -37,8 +33,8 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from engine import initial_state, legal_moves, apply_move, winner
-from net import AZNet, encode_state, move_to_index, NUM_ACTIONS
+import fastcore as fc
+from net import AZNet
 
 CKPT_PATH = os.environ.get("UTTT_CKPT", os.path.join(os.path.dirname(__file__), "az_net.pt"))
 META_PATH = CKPT_PATH[:-3] + ".meta.json" if CKPT_PATH.endswith(".pt") else CKPT_PATH + ".meta.json"
@@ -51,6 +47,7 @@ EVAL_EVERY = int(os.environ.get("UTTT_EVAL_EVERY", 2))
 WIN_THRESHOLD = float(os.environ.get("UTTT_WIN_THRESH", 0.55))
 MINUTES = float(os.environ.get("UTTT_MINUTES", 0))
 
+NUM_ACTIONS = 81
 C_PUCT = 1.5
 DIRICHLET_ALPHA = 0.3
 DIRICHLET_FRAC = 0.25
@@ -62,6 +59,7 @@ LR = 1e-3
 MAX_PLIES = 81
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+LABEL = {1: "X", 2: "O", 3: "D"}
 
 
 class Node:
@@ -82,19 +80,15 @@ class Game:
     __slots__ = ("state", "samples", "ply", "result_winner")
 
     def __init__(self):
-        self.state = initial_state()
+        self.state = fc.initial_state()
         self.samples = []
         self.ply = 0
         self.result_winner = None
 
 
 def terminal_value(state):
-    w = winner(state)
-    if w is None:
-        return None
-    if w == "D":
-        return 0.0
-    return 1.0 if state[3] == w else -1.0
+    v = fc.nb_terminal_value(state)
+    return None if v == 2.0 else v
 
 
 def select_child(node):
@@ -118,24 +112,24 @@ def backup(path, value):
 
 
 def expand(node, logits_row):
-    moves = legal_moves(node.state)
+    moves = fc.nb_legal(node.state)
     node.expanded = True
-    if not moves:
+    if moves.shape[0] == 0:
         node.terminal_value = 0.0
         return
-    idxs = np.fromiter((move_to_index(m) for m in moves), dtype=np.int64, count=len(moves))
-    masked = logits_row[idxs]
+    masked = logits_row[moves]
     masked = masked - masked.max()
     exp = np.exp(masked)
     probs = exp / exp.sum()
-    for m, p in zip(moves, probs):
-        node.children[m] = Node(float(p), apply_move(node.state, m))
+    ch, st = node.children, node.state
+    for k in range(moves.shape[0]):
+        mv = int(moves[k])
+        ch[mv] = Node(float(probs[k]), fc.nb_apply(st, mv))
 
 
 @torch.no_grad()
 def batched_eval(net, states):
-    arr = np.stack([encode_state(s) for s in states])
-    x = torch.from_numpy(arr).to(DEVICE, non_blocking=True)
+    x = torch.from_numpy(fc.encode_batch(states)).to(DEVICE, non_blocking=True)
     logits, values = net(x)
     return logits.detach().cpu().numpy(), values.detach().cpu().numpy()
 
@@ -194,34 +188,38 @@ def self_play(net, n_games):
     active = list(games)
     move_no = 0
     while active and move_no < MAX_PLIES:
-        policies = batched_mcts(net, [g.state for g in active], MCTS_SIMULATIONS, add_dirichlet=True)
+        states = [g.state for g in active]
+        root_enc = fc.encode_batch(states)
+        policies = batched_mcts(net, states, MCTS_SIMULATIONS, add_dirichlet=True)
         still = []
-        for g, (moves, visits) in zip(active, policies):
+        for i, (g, (moves, visits)) in enumerate(zip(active, policies)):
             total = visits.sum()
             dist = visits / total if total > 0 else np.ones(len(moves)) / len(moves)
             pi = np.zeros(NUM_ACTIONS, dtype=np.float32)
-            for m, p in zip(moves, dist):
-                pi[move_to_index(m)] = p
-            g.samples.append((encode_state(g.state), pi, g.state[3]))
+            for k, mv in enumerate(moves):
+                pi[mv] = dist[k]
+            g.samples.append((root_enc[i].copy(), pi, int(g.state[91])))
             if g.ply < TEMP_MOVES and total > 0:
                 chosen = moves[np.random.choice(len(moves), p=dist / dist.sum())]
             else:
                 chosen = moves[int(visits.argmax())]
-            g.state = apply_move(g.state, chosen)
+            g.state = fc.nb_apply(g.state, chosen)
             g.ply += 1
-            w = winner(g.state)
-            if w is not None:
+            w = fc.nb_winner(g.state)
+            if w != 0:
                 g.result_winner = w
             else:
                 still.append(g)
         active = still
         move_no += 1
 
-    samples, results = [], {"X": 0, "O": 0, "D": 0}
+    samples, results = [], {1: 0, 2: 0, 3: 0}
     for g in games:
-        w = g.result_winner if g.result_winner is not None else (winner(g.state) or "D")
-        results[w if w in results else "D"] += 1
-        rf = {"X": 0.0, "O": 0.0} if w == "D" else {w: 1.0, ("O" if w == "X" else "X"): -1.0}
+        w = g.result_winner if g.result_winner is not None else fc.nb_winner(g.state)
+        if w == 0:
+            w = 3
+        results[w] += 1
+        rf = {1: 0.0, 2: 0.0} if w == 3 else {w: 1.0, (2 if w == 1 else 1): -1.0}
         for enc, pi, player in g.samples:
             samples.append((enc, pi, rf[player]))
     return samples, results
@@ -235,7 +233,7 @@ def duel(net_a, net_b, n_games, sims):
     while active and move_no < MAX_PLIES:
         a_items, a_states, b_items, b_states = [], [], [], []
         for g, a_is_x in active:
-            a_to_move = (g.state[3] == "X") == a_is_x
+            a_to_move = (int(g.state[91]) == 1) == a_is_x
             if a_to_move:
                 a_items.append((g, a_is_x)); a_states.append(g.state)
             else:
@@ -250,19 +248,19 @@ def duel(net_a, net_b, n_games, sims):
                     chosen = moves[np.random.choice(len(moves), p=dist / dist.sum())]
                 else:
                     chosen = moves[int(visits.argmax())]
-                g.state = apply_move(g.state, chosen)
+                g.state = fc.nb_apply(g.state, chosen)
                 g.ply += 1
-                if winner(g.state) is None:
+                if fc.nb_winner(g.state) == 0:
                     still.append((g, a_is_x))
         active = still
         move_no += 1
 
     points = 0.0
     for g, a_is_x in games:
-        w = winner(g.state) or "D"
-        if w == "D":
+        w = fc.nb_winner(g.state)
+        if w == 0 or w == 3:
             points += 0.5
-        elif w == ("X" if a_is_x else "O"):
+        elif w == (1 if a_is_x else 2):
             points += 1.0
     return points / n_games
 
@@ -350,6 +348,8 @@ def main():
     if DEVICE == "cuda":
         torch.backends.cudnn.benchmark = True
 
+    fc.validate_against_engine(60)  # safety + warms up the Numba JIT
+
     net = AZNet().to(DEVICE)
     resumed = try_load(net, CKPT_PATH)
     net.eval()
@@ -397,7 +397,7 @@ def main():
             else:
                 gate = f"rejected score={score:.2f} (keep best elo={meta['elo']:.0f})"
 
-        msg = (f"[iter {it}] X/O/D={results['X']}/{results['O']}/{results['D']} "
+        msg = (f"[iter {it}] X/O/D={results[1]}/{results[2]}/{results[3]} "
                f"buffer={len(buffer)} selfplay={time.time() - t0:.1f}s")
         if tr:
             msg += f" ploss={tr[0]:.3f} vloss={tr[1]:.3f}"
