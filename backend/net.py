@@ -61,22 +61,40 @@ def index_to_move(idx):
     return (idx // 9, idx % 9)
 
 
-class AZNet(nn.Module):
-    def __init__(self, hidden=256):
+class _ResBlock(nn.Module):
+    """Pre-activation-free residual MLP block: x -> relu(x + W2 relu(W1 x))."""
+    def __init__(self, hidden):
         super().__init__()
-        self.trunk = nn.Sequential(
-            nn.Linear(INPUT_DIM, hidden), nn.ReLU(),
-            nn.Linear(hidden, hidden), nn.ReLU(),
-            nn.Linear(hidden, hidden), nn.ReLU(),
-        )
+        self.fc1 = nn.Linear(hidden, hidden)
+        self.fc2 = nn.Linear(hidden, hidden)
+
+    def forward(self, x):
+        h = F.relu(self.fc1(x))
+        h = self.fc2(h)
+        return F.relu(x + h)
+
+
+class AZNet(nn.Module):
+    """Residual MLP policy + value network.
+
+    Bigger capacity than the original 3-layer trunk for a stronger ceiling, while
+    keeping the exact I/O contract (486-float input -> 81 policy logits + 1 value),
+    so the TypeScript encoder, parity tests, and ONNX export remain valid.
+    """
+    def __init__(self, hidden=512, blocks=4):
+        super().__init__()
+        self.stem = nn.Sequential(nn.Linear(INPUT_DIM, hidden), nn.ReLU())
+        self.blocks = nn.ModuleList([_ResBlock(hidden) for _ in range(blocks)])
         self.policy_head = nn.Linear(hidden, NUM_ACTIONS)
         self.value_head = nn.Sequential(
-            nn.Linear(hidden, 64), nn.ReLU(),
-            nn.Linear(64, 1), nn.Tanh(),
+            nn.Linear(hidden, 128), nn.ReLU(),
+            nn.Linear(128, 1), nn.Tanh(),
         )
 
     def forward(self, x):
-        h = self.trunk(x)
+        h = self.stem(x)
+        for blk in self.blocks:
+            h = blk(h)
         return self.policy_head(h), self.value_head(h).squeeze(-1)
 
 

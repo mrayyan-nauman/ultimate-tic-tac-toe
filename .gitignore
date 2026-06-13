@@ -27,3 +27,6 @@ Thumbs.db
 PrecisionTouchPad_DCH_ASUS_Z_V16.0.0.41_47015.exe
 *.lit
 *.exe
+
+# local model backups
+*.bak
