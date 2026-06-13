@@ -128,6 +128,66 @@ def encode_batch(states):
     return planes.reshape(B, 486)
 
 
+def encode_batch_v2(states):
+    """Vectorized 11-plane encoder -> (B,891), identical to net.encode_state_v2."""
+    B = len(states)
+    arr = np.stack(states)
+    boards = arr[:, :81].reshape(B, 9, 9)
+    sw = arr[:, 81:90]
+    actives = arr[:, 90].astype(np.int64)
+    players = arr[:, 91]
+
+    planes = np.zeros((B, 11, 9, 9), np.float32)
+    planes[:, 0] = boards == 1
+    planes[:, 1] = boards == 2
+    planes[:, 2] = (sw == 1)[:, :, None]
+    planes[:, 3] = (sw == 2)[:, :, None]
+
+    has_active = actives != 9
+    aw = np.zeros(B, np.int8)
+    rows = np.arange(B)
+    aw[has_active] = sw[rows[has_active], actives[has_active]]
+    play_anywhere = (~has_active) | (aw != 0)
+    bi_idx = np.arange(9)
+    board_playable = (sw == 0) & (play_anywhere[:, None] | (bi_idx[None, :] == actives[:, None]))
+    planes[:, 4] = (boards == 0) & board_playable[:, :, None]
+    planes[:, 5] = (players == 1)[:, None, None]
+
+    # 6: free-move cells (column ci where board ci is decided)
+    planes[:, 6] = (sw != 0)[:, None, :]
+
+    # 7/8: immediate sub-board-winning cells for X(1) / O(2), undecided boards
+    undec = (sw == 0)[:, :, None]
+    for mark, plane in ((1, 7), (2, 8)):
+        win = np.zeros((B, 9, 9), bool)
+        for li in range(8):
+            a, b, c = int(_LINES[li, 0]), int(_LINES[li, 1]), int(_LINES[li, 2])
+            va, vb, vc = boards[:, :, a], boards[:, :, b], boards[:, :, c]
+            cnt_m = (va == mark).astype(np.int8) + (vb == mark) + (vc == mark)
+            cnt_0 = (va == 0).astype(np.int8) + (vb == 0) + (vc == 0)
+            lt = (cnt_m == 2) & (cnt_0 == 1)
+            win[:, :, a] |= lt & (va == 0)
+            win[:, :, b] |= lt & (vb == 0)
+            win[:, :, c] |= lt & (vc == 0)
+        planes[:, plane] = win & undec
+
+    # 9/10: macro-threat boards for X / O
+    macro = np.where(sw == 3, 0, sw)
+    thr_x = np.zeros((B, 9), bool)
+    thr_o = np.zeros((B, 9), bool)
+    for li in range(8):
+        a, b, c = int(_LINES[li, 0]), int(_LINES[li, 1]), int(_LINES[li, 2])
+        for i, j, k in ((a, b, c), (b, a, c), (c, a, b)):
+            mj, mk = macro[:, j], macro[:, k]
+            thr_x[:, i] |= (mj == 1) & (mk == 1)
+            thr_o[:, i] |= (mj == 2) & (mk == 2)
+    sw0 = sw == 0
+    planes[:, 9] = (thr_x & sw0)[:, :, None]
+    planes[:, 10] = (thr_o & sw0)[:, :, None]
+
+    return planes.reshape(B, 891)
+
+
 def from_canonical(cstate):
     cb, cw, ca, cp = cstate
     s = np.zeros(92, dtype=np.int8)
@@ -146,7 +206,7 @@ def from_canonical(cstate):
 def validate_against_engine(n=300, seed=0):
     import random as _r
     from engine import initial_state as cinit, legal_moves as cleg, apply_move as cap, winner as cwin
-    from net import encode_state as cenc
+    from net import encode_state as cenc, encode_state_v2 as cenc2
 
     _r.seed(seed)
     for _ in range(n):
@@ -163,7 +223,8 @@ def validate_against_engine(n=300, seed=0):
         cw = cwin(cs)
         cw_i = 0 if cw is None else (1 if cw == "X" else 2 if cw == "O" else 3)
         assert cw_i == nb_winner(fs), "winner mismatch"
-        assert np.array_equal(cenc(cs), encode_batch([fs])[0]), "encode mismatch"
+        assert np.array_equal(cenc(cs), encode_batch([fs])[0]), "encode v1 mismatch"
+        assert np.array_equal(cenc2(cs), encode_batch_v2([fs])[0]), "encode v2 mismatch"
     return True
 
 

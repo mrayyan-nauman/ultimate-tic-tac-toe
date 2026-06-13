@@ -37,14 +37,15 @@ import torch
 import torch.nn.functional as F
 
 import fastcore as fc
-from net import AZNet, OldAZNet
+from net import AZNet, OldAZNet, INPUT_DIM, INPUT_DIM_V2
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DEPLOY_CKPT = os.environ.get("UTTT_CKPT", os.path.join(HERE, "az_net.pt"))
 DEPLOY_META = DEPLOY_CKPT[:-3] + ".meta.json" if DEPLOY_CKPT.endswith(".pt") else DEPLOY_CKPT + ".meta.json"
 TRAIN_CKPT = DEPLOY_CKPT[:-3] + ".train.pt" if DEPLOY_CKPT.endswith(".pt") else DEPLOY_CKPT + ".train.pt"
 TRAIN_META = DEPLOY_CKPT[:-3] + ".train.json" if DEPLOY_CKPT.endswith(".pt") else DEPLOY_CKPT + ".train.json"
-OLD_PATH = DEPLOY_CKPT + ".bak"
+OLD_PATH = os.environ.get("UTTT_OLD", DEPLOY_CKPT + ".bak")
+PLANES = int(os.environ.get("UTTT_PLANES", 6))  # 6 = v1 encoding, 11 = v2 (tactical planes)
 
 PARALLEL_GAMES = int(os.environ.get("UTTT_GAMES", 256))
 MCTS_SIMULATIONS = int(os.environ.get("UTTT_SIMS", 64))
@@ -136,15 +137,15 @@ def expand(node, logits_row):
 
 
 @torch.no_grad()
-def batched_eval(net, states):
-    x = torch.from_numpy(fc.encode_batch(states)).to(DEVICE, non_blocking=True)
+def batched_eval(net, states, encode_fn):
+    x = torch.from_numpy(encode_fn(states)).to(DEVICE, non_blocking=True)
     logits, values = net(x)
     return logits.detach().cpu().numpy(), values.detach().cpu().numpy()
 
 
-def batched_mcts(net, states, sims, add_dirichlet):
+def batched_mcts(net, states, sims, add_dirichlet, encode_fn):
     roots = [Node(1.0, s) for s in states]
-    logits, _ = batched_eval(net, states)
+    logits, _ = batched_eval(net, states, encode_fn)
     for i, r in enumerate(roots):
         expand(r, logits[i])
         if add_dirichlet and r.children:
@@ -178,7 +179,7 @@ def batched_mcts(net, states, sims, add_dirichlet):
             else:
                 backup(path, 0.0)
         if leaf_states:
-            lg, lv = batched_eval(net, leaf_states)
+            lg, lv = batched_eval(net, leaf_states, encode_fn)
             for k in range(len(leaf_nodes)):
                 expand(leaf_nodes[k], lg[k])
                 backup(leaf_paths[k], float(lv[k]))
@@ -191,14 +192,14 @@ def batched_mcts(net, states, sims, add_dirichlet):
     return out
 
 
-def self_play(net, n_games):
+def self_play(net, n_games, encode_fn):
     games = [Game() for _ in range(n_games)]
     active = list(games)
     move_no = 0
     while active and move_no < MAX_PLIES:
         states = [g.state for g in active]
-        root_enc = fc.encode_batch(states)
-        policies = batched_mcts(net, states, MCTS_SIMULATIONS, add_dirichlet=True)
+        root_enc = encode_fn(states)
+        policies = batched_mcts(net, states, MCTS_SIMULATIONS, True, encode_fn)
         still = []
         for i, (g, (moves, visits)) in enumerate(zip(active, policies)):
             total = visits.sum()
@@ -233,8 +234,9 @@ def self_play(net, n_games):
     return samples, results
 
 
-def duel(net_a, net_b, n_games, sims):
-    """net_a vs net_b, colors alternated. Returns net_a's score fraction."""
+def duel(net_a, net_b, n_games, sims, enc_a, enc_b):
+    """net_a vs net_b (each with its own encoder), colors alternated.
+    Returns net_a's score fraction."""
     games = [(Game(), i % 2 == 0) for i in range(n_games)]
     active = list(games)
     move_no = 0
@@ -246,8 +248,8 @@ def duel(net_a, net_b, n_games, sims):
                 a_items.append((g, a_is_x)); a_states.append(g.state)
             else:
                 b_items.append((g, a_is_x)); b_states.append(g.state)
-        pol_a = batched_mcts(net_a, a_states, sims, True) if a_states else []
-        pol_b = batched_mcts(net_b, b_states, sims, True) if b_states else []
+        pol_a = batched_mcts(net_a, a_states, sims, True, enc_a) if a_states else []
+        pol_b = batched_mcts(net_b, b_states, sims, True, enc_b) if b_states else []
         still = []
         for items, pols in ((a_items, pol_a), (b_items, pol_b)):
             for (g, a_is_x), (moves, visits) in zip(items, pols):
@@ -334,15 +336,22 @@ def resume(net):
     return None
 
 
-def load_old():
-    if not os.path.exists(OLD_PATH):
-        print(f"[old] benchmark {os.path.basename(OLD_PATH)} not found — deploy gating disabled", flush=True)
+def load_benchmark(path):
+    """Load the (always 6-plane) benchmark opponent — either a current AZNet or
+    the original OldAZNet — whichever the checkpoint matches."""
+    if not os.path.exists(path):
+        print(f"[old] benchmark {os.path.basename(path)} not found — deploy gating disabled", flush=True)
         return None
-    old = OldAZNet().to(DEVICE)
-    if not load_into(old, OLD_PATH):
-        return None
-    old.eval()
-    return old
+    for ctor in (lambda: AZNet(input_dim=INPUT_DIM), OldAZNet):
+        net = ctor().to(DEVICE)
+        try:
+            net.load_state_dict(torch.load(path, map_location=DEVICE))
+            net.eval()
+            return net
+        except Exception:
+            continue
+    print(f"[old] could not load benchmark {os.path.basename(path)}", flush=True)
+    return None
 
 
 def deploy_best(best, meta, vs_old):
@@ -376,23 +385,30 @@ def main():
 
     fc.validate_against_engine(60)  # safety + warm up the JIT
 
-    net = AZNet().to(DEVICE)
+    # Encoding: v1 (6 planes) or v2 (11 tactical planes). The benchmark opponent
+    # is always a 6-plane net, so it uses the v1 encoder regardless.
+    enc = fc.encode_batch_v2 if PLANES == 11 else fc.encode_batch
+    enc_old = fc.encode_batch
+    input_dim = INPUT_DIM_V2 if PLANES == 11 else INPUT_DIM
+
+    net = AZNet(input_dim=input_dim).to(DEVICE)
     src = resume(net)
     net.eval()
-    best = AZNet().to(DEVICE)
+    best = AZNet(input_dim=input_dim).to(DEVICE)
     best.load_state_dict(net.state_dict())
     best.eval()
-    old = load_old()
+    old = load_benchmark(OLD_PATH)
     opt = torch.optim.Adam(net.parameters(), lr=LR)
     buffer = deque(maxlen=REPLAY_CAPACITY)
     meta = load_meta()
 
     nparams = sum(p.numel() for p in net.parameters())
     budget = f"{MINUTES:.0f}min" if MINUTES > 0 else f"{iterations} iters"
-    print(f"[init] device={DEVICE} params={nparams:,} resume={src} start_elo={meta['elo']:.0f} "
-          f"games/iter={PARALLEL_GAMES} sims={MCTS_SIMULATIONS} eval={EVAL_GAMES}g/{EVAL_SIMS}s "
-          f"every {EVAL_EVERY} winthr={WIN_THRESHOLD} vs_old_thr={VS_OLD_THRESH} "
-          f"old={'yes' if old is not None else 'no'} budget={budget} deploy={deploy}", flush=True)
+    print(f"[init] device={DEVICE} planes={PLANES} params={nparams:,} resume={src} "
+          f"start_elo={meta['elo']:.0f} games/iter={PARALLEL_GAMES} sims={MCTS_SIMULATIONS} "
+          f"eval={EVAL_GAMES}g/{EVAL_SIMS}s every {EVAL_EVERY} winthr={WIN_THRESHOLD} "
+          f"vs_old_thr={VS_OLD_THRESH} old={os.path.basename(OLD_PATH) if old is not None else 'no'} "
+          f"budget={budget} deploy={deploy}", flush=True)
 
     t_start = time.time()
     it = 0
@@ -405,13 +421,13 @@ def main():
         it += 1
 
         t0 = time.time()
-        samples, results = self_play(net, PARALLEL_GAMES)
+        samples, results = self_play(net, PARALLEL_GAMES, enc)
         buffer.extend(samples)
         tr = train(net, opt, buffer, TRAIN_STEPS_PER_ITER)
 
         gate = ""
         if it % EVAL_EVERY == 0:
-            score = duel(net, best, EVAL_GAMES, EVAL_SIMS)
+            score = duel(net, best, EVAL_GAMES, EVAL_SIMS, enc, enc)
             if score > WIN_THRESHOLD:
                 meta["elo"] += elo_diff(score)
                 meta["promotions"] += 1
@@ -422,7 +438,7 @@ def main():
             else:
                 gate = f"rejected {score:.2f}"
             if old is not None:
-                vs_old = duel(best, old, EVAL_GAMES, EVAL_SIMS)
+                vs_old = duel(best, old, EVAL_GAMES, EVAL_SIMS, enc, enc_old)
                 meta["vs_old"] = vs_old
                 save_json(TRAIN_META, meta)
                 gate += f" | vs_old={vs_old:.2f}"
@@ -439,7 +455,7 @@ def main():
     # Final, larger best-vs-old measurement → deploy decision.
     final_vs_old = None
     if old is not None:
-        final_vs_old = duel(best, old, FINAL_EVAL_GAMES, EVAL_SIMS)
+        final_vs_old = duel(best, old, FINAL_EVAL_GAMES, EVAL_SIMS, enc, enc_old)
         print(f"[vs-old] final: best scores {final_vs_old:.0%} vs old over {FINAL_EVAL_GAMES} games "
               f"(need >= {VS_OLD_THRESH:.0%} to deploy)", flush=True)
     print(f"[done] iters={it} elo={meta['elo']:.0f} promotions={meta['promotions']} "

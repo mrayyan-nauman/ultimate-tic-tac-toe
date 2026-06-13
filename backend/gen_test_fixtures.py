@@ -13,7 +13,7 @@ import os
 import random
 
 from engine import initial_state, legal_moves, apply_move, winner
-from net import encode_state
+from net import encode_state, encode_state_v2
 
 OUT_PATH = os.path.join(
     os.path.dirname(__file__), "..", "frontend", "src", "test", "ai-fixtures.json"
@@ -51,6 +51,7 @@ def main():
         samples.append({
             "state": state_to_json(state),
             "encoded": [float(x) for x in encode_state(state)],
+            "encoded_v2": [float(x) for x in encode_state_v2(state)],
             "legalMoves": [list(m) for m in legal_moves(state)],
             "winner": winner(state),
         })
