@@ -337,35 +337,44 @@ def resume(net):
 
 
 def load_benchmark(path):
-    """Load the (always 6-plane) benchmark opponent — either a current AZNet or
-    the original OldAZNet — whichever the checkpoint matches."""
+    """Load the benchmark opponent, auto-detecting its architecture + encoder
+    (v1 6-plane AZNet/OldAZNet or v2 11-plane AZNet). Returns (net, encode_fn)."""
     if not os.path.exists(path):
         print(f"[old] benchmark {os.path.basename(path)} not found — deploy gating disabled", flush=True)
-        return None
-    for ctor in (lambda: AZNet(input_dim=INPUT_DIM), OldAZNet):
-        net = ctor().to(DEVICE)
-        try:
-            net.load_state_dict(torch.load(path, map_location=DEVICE))
-            net.eval()
-            return net
-        except Exception:
-            continue
-    print(f"[old] could not load benchmark {os.path.basename(path)}", flush=True)
-    return None
+        return None, None
+    sd = torch.load(path, map_location=DEVICE)
+    indim = None
+    for k in ("stem.0.weight", "trunk.0.weight"):
+        if k in sd:
+            indim = int(sd[k].shape[1])
+            break
+    try:
+        net = AZNet(input_dim=indim).to(DEVICE) if "stem.0.weight" in sd else OldAZNet().to(DEVICE)
+        net.load_state_dict(sd)
+        net.eval()
+    except Exception as e:
+        print(f"[old] could not load benchmark {os.path.basename(path)}: {e}", flush=True)
+        return None, None
+    enc = fc.encode_batch_v2 if indim == INPUT_DIM_V2 else fc.encode_batch
+    return net, enc
 
 
 def deploy_best(best, meta, vs_old):
     try:
         print("[deploy] best beats old — exporting ONNX + pushing...", flush=True)
         torch.save(best.state_dict(), DEPLOY_CKPT)
-        save_json(DEPLOY_META, {"elo": meta["elo"], "promotions": meta["promotions"], "vs_old": vs_old})
-        subprocess.run([sys.executable, os.path.join(HERE, "export_onnx.py")], check=True, cwd=HERE)
+        save_json(DEPLOY_META, {"planes": PLANES, "elo": meta["elo"],
+                                "promotions": meta["promotions"], "vs_old": vs_old})
+        # Export the right architecture from the just-saved checkpoint (quantized).
+        env = {**os.environ, "UTTT_PLANES": str(PLANES), "UTTT_EXPORT_SRC": DEPLOY_CKPT}
+        subprocess.run([sys.executable, os.path.join(HERE, "export_onnx.py")], check=True, cwd=HERE, env=env)
         repo = os.path.dirname(HERE)
-        subprocess.run(["git", "-C", repo, "add", "backend/az_net.pt",
-                        "backend/az_net.meta.json", "frontend/public/az_net.onnx"], check=True)
+        # az_net.pt is gitignored now — only the committed meta + onnx are deployed.
+        subprocess.run(["git", "-C", repo, "add", os.path.relpath(DEPLOY_META, repo).replace("\\", "/"),
+                        "frontend/public/az_net.onnx"], check=True)
         subprocess.run(["git", "-C", repo, "commit", "-m",
                         f"Train: deploy net that beats old (vs_old={vs_old:.2f}, elo {meta['elo']:.0f})"], check=True)
-        subprocess.run(["git", "-C", repo, "push", "origin", "main"], check=True)
+        subprocess.run(["git", "-C", repo, "-c", "http.version=HTTP/1.1", "push", "origin", "main"], check=True)
         print("[deploy] pushed — Vercel will redeploy.", flush=True)
     except Exception as e:
         print(f"[deploy] FAILED: {e}", flush=True)
@@ -388,7 +397,6 @@ def main():
     # Encoding: v1 (6 planes) or v2 (11 tactical planes). The benchmark opponent
     # is always a 6-plane net, so it uses the v1 encoder regardless.
     enc = fc.encode_batch_v2 if PLANES == 11 else fc.encode_batch
-    enc_old = fc.encode_batch
     input_dim = INPUT_DIM_V2 if PLANES == 11 else INPUT_DIM
 
     net = AZNet(input_dim=input_dim).to(DEVICE)
@@ -397,7 +405,7 @@ def main():
     best = AZNet(input_dim=input_dim).to(DEVICE)
     best.load_state_dict(net.state_dict())
     best.eval()
-    old = load_benchmark(OLD_PATH)
+    old, enc_old = load_benchmark(OLD_PATH)
     opt = torch.optim.Adam(net.parameters(), lr=LR)
     buffer = deque(maxlen=REPLAY_CAPACITY)
     meta = load_meta()
