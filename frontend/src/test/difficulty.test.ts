@@ -15,17 +15,18 @@ describe("difficultyToConfig", () => {
     expect(c.maxSims).toBe(0);
   });
 
-  it("rating 2000 is argmax with the 60s budget", () => {
+  it("rating 2000 is argmax with the 15s max budget", () => {
     const c = difficultyToConfig(2000);
     expect(c.epsilon).toBe(0);
     expect(c.temperature).toBe(0);
-    expect(c.timeBudgetMs).toBe(60000);
+    expect(c.timeBudgetMs).toBe(15000);
     expect(c.maxSims).toBeGreaterThan(0);
   });
 
-  it("only the very top (2000) is allowed past the 10s cap", () => {
-    expect(difficultyToConfig(1999).timeBudgetMs).toBeLessThanOrEqual(10000);
-    expect(difficultyToConfig(2000).timeBudgetMs).toBe(60000);
+  it("no rating exceeds the 15s think cap", () => {
+    for (let r = MIN_RATING; r <= MAX_RATING; r += 1) {
+      expect(difficultyToConfig(r).timeBudgetMs).toBeLessThanOrEqual(15000);
+    }
   });
 
   it("is monotonic in every knob across the full range", () => {

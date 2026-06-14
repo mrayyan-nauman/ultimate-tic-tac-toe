@@ -37,11 +37,15 @@ def main():
     dummy = torch.zeros(1, INPUT, dtype=torch.float32)
     out_path = os.path.abspath(OUT_PATH)
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    # Export float32 to a temp graph first, then int8-quantize into the final
+    # file (≈4x smaller download). UTTT_QUANTIZE=0 keeps the float32 model.
+    quantize = os.environ.get("UTTT_QUANTIZE", "1") != "0"
+    f32_path = out_path + ".f32.tmp" if quantize else out_path
 
     torch.onnx.export(
         net,
         dummy,
-        out_path,
+        f32_path,
         input_names=["input"],
         output_names=["policy", "value"],
         dynamic_axes={
@@ -57,7 +61,7 @@ def main():
     import numpy as np
     import onnxruntime as ort
 
-    sess = ort.InferenceSession(out_path, providers=["CPUExecutionProvider"])
+    sess = ort.InferenceSession(f32_path, providers=["CPUExecutionProvider"])
     probe = torch.randn(1, INPUT, dtype=torch.float32)
     with torch.no_grad():
         ref_policy, ref_value = net(probe)
@@ -65,11 +69,22 @@ def main():
 
     p_err = np.abs(ref_policy.numpy() - ort_policy).max()
     v_err = np.abs(ref_value.numpy() - ort_value).max()
-    print(f"Exported -> {out_path}")
-    print(f"max policy abs error: {p_err:.2e}")
-    print(f"max value  abs error: {v_err:.2e}")
+    print(f"float export max policy/value abs error: {p_err:.2e} / {v_err:.2e}")
     if p_err > 1e-4 or v_err > 1e-4:
         raise SystemExit("ONNX output diverges from PyTorch; aborting.")
+
+    if quantize:
+        from onnxruntime.quantization import quantize_dynamic, QuantType
+        quantize_dynamic(f32_path, out_path, weight_type=QuantType.QInt8)
+        os.remove(f32_path)
+        # Report int8 vs float32 divergence on the probe (looser; informational).
+        qsess = ort.InferenceSession(out_path, providers=["CPUExecutionProvider"])
+        qp, qv = qsess.run(None, {"input": probe.numpy()})
+        print(f"int8 vs float max policy/value abs diff: "
+              f"{np.abs(ort_policy - qp).max():.3f} / {np.abs(ort_value - qv).max():.3f}")
+        print(f"Exported (int8) -> {out_path}  ({os.path.getsize(out_path) / 1e6:.2f} MB)")
+    else:
+        print(f"Exported (float32) -> {out_path}  ({os.path.getsize(out_path) / 1e6:.2f} MB)")
     print("ONNX export verified OK.")
 
 

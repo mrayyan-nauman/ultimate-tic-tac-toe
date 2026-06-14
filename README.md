@@ -57,8 +57,10 @@ to three strength knobs that together span the whole range:
 | 1            | Uniformly random moves                                            |
 | ~1–600       | Mostly random → raw policy, no tree search                        |
 | ~600–1400    | Light, then growing MCTS; temperature softens move choice         |
-| ~1400–1999   | Argmax MCTS, thinking budget up to **10 s**                       |
-| 2000         | The strongest the deployed net can play — up to **60 s** / move   |
+| ~1400–1999   | Argmax MCTS, growing thinking budget                              |
+| 2000         | The strongest the deployed net can play                           |
+
+Think time is **capped at 15 s per move at every rating**.
 
 **2000 is anchored to the *currently deployed* network.** Train and deploy a
 stronger net and "2000" automatically re-anchors to that net's maximum, with the

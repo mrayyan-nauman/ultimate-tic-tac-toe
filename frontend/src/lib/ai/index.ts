@@ -15,6 +15,21 @@ export interface MoveResult {
   cellIndex: number;
 }
 
+// If the model + WASM don't finish loading within this window, fall back to a
+// random move instead of hanging (e.g. very slow / blocked CDN). The session
+// keeps loading in the background, so later moves use the real net once ready.
+const MODEL_LOAD_TIMEOUT_MS = 20000;
+
+function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms);
+    promise.then(
+      (v) => { clearTimeout(timer); resolve(v); },
+      (e) => { clearTimeout(timer); reject(e); },
+    );
+  });
+}
+
 function uniformRandom(moves: Move[]): MoveResult {
   const [bi, ci] = moves[Math.floor(Math.random() * moves.length)];
   return { boardIndex: bi, cellIndex: ci };
@@ -85,7 +100,7 @@ export async function getAIMove(
 
   let session;
   try {
-    session = await loadModel();
+    session = await withTimeout(loadModel(), MODEL_LOAD_TIMEOUT_MS, "model load");
   } catch (err) {
     console.warn("[AI] model load failed, playing randomly:", err);
     return uniformRandom(moves);

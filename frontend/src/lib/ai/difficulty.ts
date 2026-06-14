@@ -10,7 +10,8 @@
 //                bottom; the only knob that can make play *worse than the net*).
 //   temperature  softness of move selection over the policy / visit counts
 //                (high = varied & weak, 0 = argmax = sharpest).
-//   timeBudgetMs MCTS thinking budget (0 = policy-only, no tree search).
+//   timeBudgetMs MCTS thinking budget (0 = policy-only, no tree search), capped
+//                at MAX_THINK_MS (15 s) for every rating.
 //   maxSims      hard safety cap on simulations regardless of time.
 
 export interface AIConfig {
@@ -43,9 +44,12 @@ const ANCHORS: Anchor[] = [
   [1500, 0.00, 0.18, 2200,   2500],
   [1700, 0.00, 0.08, 4000,   6000],   // approaching argmax
   [1850, 0.00, 0.00, 6500,   15000],  // argmax from here up
-  [1999, 0.00, 0.00, 10000,  40000],  // 10 s cap below the very top
-  [2000, 0.00, 0.00, 60000,  120000], // the only level allowed past 10 s
+  [1999, 0.00, 0.00, 12000,  40000],
+  [2000, 0.00, 0.00, 15000,  120000], // max think
 ];
+
+// Hard cap on AI think time at every rating (ms).
+export const MAX_THINK_MS = 15000;
 
 function lerp(a: number, b: number, t: number): number {
   return a + (b - a) * t;
@@ -77,7 +81,7 @@ export function difficultyToConfig(rating: number): AIConfig {
   return {
     epsilon: lerp(lo[1], hi[1], t),
     temperature: lerp(lo[2], hi[2], t),
-    timeBudgetMs: Math.round(lerp(lo[3], hi[3], t)),
+    timeBudgetMs: Math.min(MAX_THINK_MS, Math.round(lerp(lo[3], hi[3], t))),
     maxSims: Math.round(lerp(lo[4], hi[4], t)),
   };
 }
