@@ -37,3 +37,6 @@ PrecisionTouchPad_DCH_ASUS_Z_V16.0.0.41_47015.exe
 
 # big training checkpoint — only the exported .onnx needs to be in git
 backend/az_net.pt
+
+# all backend checkpoints (only the exported .onnx is deployed)
+backend/*.pt

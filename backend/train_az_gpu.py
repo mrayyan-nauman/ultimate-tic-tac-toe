@@ -37,7 +37,11 @@ import torch
 import torch.nn.functional as F
 
 import fastcore as fc
-from net import AZNet, OldAZNet, INPUT_DIM, INPUT_DIM_V2
+from net import AZNet, AZNetConv, OldAZNet, INPUT_DIM, INPUT_DIM_V2
+
+ARCH = os.environ.get("UTTT_ARCH", "mlp")          # mlp | conv
+CONV_CH = int(os.environ.get("UTTT_CH", 64))
+CONV_BLOCKS = int(os.environ.get("UTTT_BLOCKS", 6))
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DEPLOY_CKPT = os.environ.get("UTTT_CKPT", os.path.join(HERE, "az_net.pt"))
@@ -366,7 +370,8 @@ def deploy_best(best, meta, vs_old):
         save_json(DEPLOY_META, {"planes": PLANES, "elo": meta["elo"],
                                 "promotions": meta["promotions"], "vs_old": vs_old})
         # Export the right architecture from the just-saved checkpoint (quantized).
-        env = {**os.environ, "UTTT_PLANES": str(PLANES), "UTTT_EXPORT_SRC": DEPLOY_CKPT}
+        env = {**os.environ, "UTTT_PLANES": str(PLANES), "UTTT_EXPORT_SRC": DEPLOY_CKPT,
+               "UTTT_ARCH": ARCH, "UTTT_CH": str(CONV_CH), "UTTT_BLOCKS": str(CONV_BLOCKS)}
         subprocess.run([sys.executable, os.path.join(HERE, "export_onnx.py")], check=True, cwd=HERE, env=env)
         repo = os.path.dirname(HERE)
         # az_net.pt is gitignored now — only the committed meta + onnx are deployed.
@@ -378,6 +383,12 @@ def deploy_best(best, meta, vs_old):
         print("[deploy] pushed — Vercel will redeploy.", flush=True)
     except Exception as e:
         print(f"[deploy] FAILED: {e}", flush=True)
+
+
+def build_net(input_dim):
+    if ARCH == "conv":
+        return AZNetConv(input_dim=input_dim, channels=CONV_CH, blocks=CONV_BLOCKS).to(DEVICE)
+    return AZNet(input_dim=input_dim).to(DEVICE)
 
 
 def main():
@@ -399,10 +410,10 @@ def main():
     enc = fc.encode_batch_v2 if PLANES == 11 else fc.encode_batch
     input_dim = INPUT_DIM_V2 if PLANES == 11 else INPUT_DIM
 
-    net = AZNet(input_dim=input_dim).to(DEVICE)
+    net = build_net(input_dim)
     src = resume(net)
     net.eval()
-    best = AZNet(input_dim=input_dim).to(DEVICE)
+    best = build_net(input_dim)
     best.load_state_dict(net.state_dict())
     best.eval()
     old, enc_old = load_benchmark(OLD_PATH)
@@ -412,7 +423,7 @@ def main():
 
     nparams = sum(p.numel() for p in net.parameters())
     budget = f"{MINUTES:.0f}min" if MINUTES > 0 else f"{iterations} iters"
-    print(f"[init] device={DEVICE} planes={PLANES} params={nparams:,} resume={src} "
+    print(f"[init] device={DEVICE} arch={ARCH} planes={PLANES} params={nparams:,} resume={src} "
           f"start_elo={meta['elo']:.0f} games/iter={PARALLEL_GAMES} sims={MCTS_SIMULATIONS} "
           f"eval={EVAL_GAMES}g/{EVAL_SIMS}s every {EVAL_EVERY} winthr={WIN_THRESHOLD} "
           f"vs_old_thr={VS_OLD_THRESH} old={os.path.basename(OLD_PATH) if old is not None else 'no'} "

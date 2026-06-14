@@ -194,6 +194,70 @@ class OldAZNet(nn.Module):
         return self.policy_head(h), self.value_head(h).squeeze(-1)
 
 
+def _spatial_perm():
+    """Permutation mapping the encoder's (sub-board, cell) cell order to the true
+    9x9 board geometry, so convolutions see spatially-adjacent cells.
+    spatial[g] = input[perm[g]], where g = global_row*9 + global_col."""
+    perm = [0] * 81
+    for bi in range(9):
+        for ci in range(9):
+            grow = (bi // 3) * 3 + ci // 3
+            gcol = (bi % 3) * 3 + ci % 3
+            perm[grow * 9 + gcol] = bi * 9 + ci
+    return perm
+
+
+class _ConvResBlock(nn.Module):
+    def __init__(self, ch):
+        super().__init__()
+        self.c1 = nn.Conv2d(ch, ch, 3, padding=1, bias=False)
+        self.b1 = nn.BatchNorm2d(ch)
+        self.c2 = nn.Conv2d(ch, ch, 3, padding=1, bias=False)
+        self.b2 = nn.BatchNorm2d(ch)
+
+    def forward(self, x):
+        h = F.relu(self.b1(self.c1(x)))
+        h = self.b2(self.c2(h))
+        return F.relu(x + h)
+
+
+class AZNetConv(nn.Module):
+    """Convolutional residual network over the TRUE 9x9 board geometry — a higher
+    ceiling than the MLP because it exploits the board's spatial structure.
+
+    Drop-in for AZNet: takes the same flat (N, 891) v2 encoding (it reshapes +
+    permutes to a spatial 11x9x9 tensor internally) and returns the same
+    (policy[N,81], value[N]) in canonical move order. So the encoder, parity
+    tests, ONNX I/O, and frontend stay unchanged — deploy is just an ONNX swap.
+    """
+    def __init__(self, input_dim=INPUT_DIM_V2, channels=64, blocks=6):
+        super().__init__()
+        self.planes = input_dim // 81
+        self.register_buffer("perm", torch.tensor(_spatial_perm(), dtype=torch.long))
+        self.stem = nn.Conv2d(self.planes, channels, 3, padding=1, bias=False)
+        self.stem_bn = nn.BatchNorm2d(channels)
+        self.blocks = nn.ModuleList([_ConvResBlock(channels) for _ in range(blocks)])
+        self.p_conv = nn.Conv2d(channels, 32, 1, bias=False)
+        self.p_bn = nn.BatchNorm2d(32)
+        self.p_fc = nn.Linear(32 * 81, NUM_ACTIONS)
+        self.v_conv = nn.Conv2d(channels, 32, 1, bias=False)
+        self.v_bn = nn.BatchNorm2d(32)
+        self.v_fc1 = nn.Linear(32 * 81, 64)
+        self.v_fc2 = nn.Linear(64, 1)
+
+    def forward(self, x):
+        n = x.shape[0]
+        x = x.view(n, self.planes, 81)[:, :, self.perm].reshape(n, self.planes, 9, 9)
+        h = F.relu(self.stem_bn(self.stem(x)))
+        for blk in self.blocks:
+            h = blk(h)
+        p = F.relu(self.p_bn(self.p_conv(h))).reshape(n, -1)
+        p = self.p_fc(p)
+        v = F.relu(self.v_bn(self.v_conv(h))).reshape(n, -1)
+        v = torch.tanh(self.v_fc2(F.relu(self.v_fc1(v)))).squeeze(-1)
+        return p, v
+
+
 @torch.no_grad()
 def predict(net, state, device="cpu"):
     """Return (policy_probs over legal moves dict, value scalar)."""

@@ -12,17 +12,21 @@ import os
 
 import torch
 
-from net import AZNet, INPUT_DIM, INPUT_DIM_V2
+from net import AZNet, AZNetConv, INPUT_DIM, INPUT_DIM_V2
 
-# UTTT_PLANES=11 exports the v2 (tactical-plane) net; UTTT_EXPORT_SRC overrides
-# which checkpoint to export (default az_net.pt).
+# UTTT_PLANES=11 exports the v2 (tactical-plane) net; UTTT_ARCH=conv exports the
+# convolutional net; UTTT_EXPORT_SRC overrides the checkpoint (default az_net.pt).
 PLANES = int(os.environ.get("UTTT_PLANES", 6))
+ARCH = os.environ.get("UTTT_ARCH", "mlp")
+CONV_CH = int(os.environ.get("UTTT_CH", 64))
+CONV_BLOCKS = int(os.environ.get("UTTT_BLOCKS", 6))
 INPUT = INPUT_DIM_V2 if PLANES == 11 else INPUT_DIM
 CKPT_PATH = os.environ.get(
     "UTTT_EXPORT_SRC", os.path.join(os.path.dirname(__file__), "az_net.pt")
 )
-OUT_PATH = os.path.join(
-    os.path.dirname(__file__), "..", "frontend", "public", "az_net.onnx"
+OUT_PATH = os.environ.get(
+    "UTTT_OUT",
+    os.path.join(os.path.dirname(__file__), "..", "frontend", "public", "az_net.onnx"),
 )
 
 
@@ -30,7 +34,8 @@ def main():
     if not os.path.exists(CKPT_PATH):
         raise SystemExit(f"Checkpoint not found: {CKPT_PATH}")
 
-    net = AZNet(input_dim=INPUT)
+    net = AZNetConv(input_dim=INPUT, channels=CONV_CH, blocks=CONV_BLOCKS) if ARCH == "conv" \
+        else AZNet(input_dim=INPUT)
     net.load_state_dict(torch.load(CKPT_PATH, map_location="cpu"))
     net.eval()
 
