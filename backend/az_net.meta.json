@@ -1,8 +1,6 @@
 {
-  "encoding": "v2",
   "planes": 11,
-  "elo": 1143,
-  "promotions": 10,
-  "vs_v1": 0.8,
-  "note": "v2 tactical-plane net; ~0.80 vs the v1 net (v1 beats the original pre-GPU net ~0.76)"
+  "elo": 2570.319491569207,
+  "promotions": 39,
+  "vs_old": 0.70625
 }
