@@ -1,6 +1,9 @@
 {
   "planes": 11,
-  "elo": 2570.319491569207,
-  "promotions": 39,
-  "vs_old": 0.70625
+  "arch": "conv",
+  "ch": 96,
+  "blocks": 8,
+  "elo": 1038.0699068302238,
+  "v4_vs_v3": 0.8475,
+  "promotions": 15
 }
