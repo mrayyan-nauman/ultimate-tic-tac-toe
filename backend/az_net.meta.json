@@ -3,7 +3,6 @@
   "arch": "conv",
   "ch": 96,
   "blocks": 8,
-  "elo": 1038.0699068302238,
-  "v4_vs_v3": 0.8475,
-  "promotions": 15
+  "model": "v5",
+  "vs_v3": "0.88"
 }
